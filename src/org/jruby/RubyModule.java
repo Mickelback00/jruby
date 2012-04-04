@@ -94,7 +94,6 @@ import org.jruby.runtime.builtin.Variable;
 import org.jruby.runtime.callback.Callback;
 import org.jruby.runtime.callsite.CacheEntry;
 import org.jruby.runtime.callsite.FunctionalCachingCallSite;
-import org.jruby.runtime.load.IAutoloadMethod;
 import org.jruby.runtime.marshal.MarshalStream;
 import org.jruby.runtime.marshal.UnmarshalStream;
 import org.jruby.util.ClassProvider;
@@ -192,19 +191,6 @@ public class RubyModule extends RubyObject {
 
     public synchronized Map<String, IRubyObject> getConstantMapForWrite() {
         return constants == Collections.EMPTY_MAP ? constants = new ConcurrentHashMap<String, IRubyObject>(4, 0.9f, 1) : constants;
-    }
-    
-    /**
-     * AutoloadMap must be accessed after checking ConstantMap. Checking UNDEF value in constantMap works as a guard.
-     * For looking up constant, check constantMap first then try to get an Autoload object from autoloadMap.
-     * For setting constant, update constantMap first and remove an Autoload object from autoloadMap.
-     */
-    private Map<String, Autoload> getAutoloadMap() {
-        return autoloads;
-    }
-    
-    private synchronized Map<String, Autoload> getAutoloadMapForWrite() {
-        return autoloads == Collections.EMPTY_MAP ? autoloads = new ConcurrentHashMap<String, Autoload>(4, 0.9f, 1) : autoloads;
     }
     
     public void addIncludingHierarchy(IncludedModuleWrapper hierarchy) {
@@ -2600,7 +2586,7 @@ public class RubyModule extends RubyObject {
             if (value != UNDEF) {
                 return value;
             }
-            removeAutoload(name);
+            context.getRuntime().getLoadService().removeAutoLoadFor(getName() + "::" + name);
             // FIXME: I'm not sure this is right, but the old code returned
             // the undef, which definitely isn't right...
             return context.getRuntime().getNil();
@@ -2915,12 +2901,22 @@ public class RubyModule extends RubyObject {
 
     private IRubyObject iterateConstantNoConstMissing(String name, RubyModule init, boolean inherit) {
         for (RubyModule p = init; p != null; p = p.getSuperClass()) {
-            IRubyObject value = p.getConstantAt(name);
+            IRubyObject value = p.getConstantInner(name);
 
             if (value != null) return value == UNDEF ? null : value;
             if (!inherit) break;
         }
         return null;
+    }
+    
+    protected IRubyObject getConstantInner(String name) {
+        IRubyObject value = constantTableFetch(name);
+
+        for (; value == UNDEF; value = constantTableFetch(name)) {
+            if (resolveUndefConstant(getRuntime(), name) == null) return UNDEF;
+        }
+        
+        return value;
     }
 
     // not actually called anywhere (all known uses call the fast version)
@@ -2946,7 +2942,8 @@ public class RubyModule extends RubyObject {
         while (p != null) {
             if ((value = p.constantTableFastFetch(internedName)) != null) {
                 if (value == UNDEF) {
-                    return p.resolveUndefConstant(runtime, internedName);
+                    if (p.resolveUndefConstant(runtime, internedName) == null) break;
+                    continue; // Not that is loaded loop around to resolve it next pass
                 }
 
                 if (p == objectClass && this != objectClass) {
@@ -2971,7 +2968,9 @@ public class RubyModule extends RubyObject {
     }
     
     public IRubyObject resolveUndefConstant(Ruby runtime, String name) {
-        return getAutoloadConstant(runtime, name);
+        if (!runtime.is1_9()) deleteConstant(name);
+        
+        return runtime.getLoadService().autoload(getName() + "::" + name);
     }
 
     /**
@@ -3010,20 +3009,19 @@ public class RubyModule extends RubyObject {
     private IRubyObject setConstantCommon(String name, IRubyObject value, boolean warn) {
         IRubyObject oldValue = fetchConstant(name);
         if (oldValue != null) {
+            Ruby runtime = getRuntime();
             if (oldValue == UNDEF) {
-                setAutoloadConstant(name, value);
+                runtime.getLoadService().removeAutoLoadFor(getName() + "::" + name);
             } else {
                 if (warn) {
-                    getRuntime().getWarnings().warn(ID.CONSTANT_ALREADY_INITIALIZED, "already initialized constant " + name);
+                    runtime.getWarnings().warn(ID.CONSTANT_ALREADY_INITIALIZED, "already initialized constant " + name);
                 }
-                storeConstant(name, value);
             }
-        } else {
-            storeConstant(name, value);
         }
 
+        storeConstant(name, value);
         invalidateConstantCache();
-        
+
         // if adding a module under a constant name, set that module's basename to the constant name
         if (value instanceof RubyModule) {
             RubyModule module = (RubyModule)value;
@@ -3070,7 +3068,8 @@ public class RubyModule extends RubyObject {
             Object value;
             if ((value = module.constantTableFetch(name)) != null) {
                 if (value != UNDEF) return true;
-                return getAutoloadMap().get(name) != null;
+                return getRuntime().getLoadService().autoloadFor(
+                        module.getName() + "::" + name) != null;
             }
 
         } while (isObject && (module = module.getSuperClass()) != null );
@@ -3089,7 +3088,8 @@ public class RubyModule extends RubyObject {
             Object value;
             if ((value = module.constantTableFastFetch(internedName)) != null) {
                 if (value != UNDEF) return true;
-                return getAutoloadMap().get(internedName) != null;
+                return getRuntime().getLoadService().autoloadFor(
+                        module.getName() + "::" + internedName) != null;
             }
 
         } while (isObject && (module = module.getSuperClass()) != null );
@@ -3109,7 +3109,8 @@ public class RubyModule extends RubyObject {
             Object value;
             if ((value = module.constantTableFastFetch(internedName)) != null) {
                 if (value != UNDEF) return true;
-                return getAutoloadMap().get(internedName) != null;
+                return getRuntime().getLoadService().autoloadFor(
+                        module.getName() + "::" + internedName) != null;
             }
             if (!inherit) {
                 break;
@@ -3321,7 +3322,8 @@ public class RubyModule extends RubyObject {
         ensureConstantsSettable();
         return constantTableRemove(name);
     }
-    
+
+
     @Deprecated
     public List<Variable<IRubyObject>> getStoredConstantList() {
         return null;
@@ -3381,73 +3383,6 @@ public class RubyModule extends RubyObject {
         
     protected IRubyObject constantTableRemove(String name) {
         return getConstantMapForWrite().remove(name);
-    }
-    
-    /**
-     * Define an autoload. ConstantMap holds UNDEF for the name as an autoload marker.
-     */
-    protected void defineAutoload(String name, IAutoloadMethod loadMethod) {
-        storeConstant(name, RubyObject.UNDEF);
-        getAutoloadMapForWrite().put(name, new Autoload(loadMethod));
-    }
-    
-    /**
-     * Extract an Object which is defined by autoload thread from autoloadMap and define it as a constant.
-     */
-    protected IRubyObject finishAutoload(String name) {
-        Autoload autoload = getAutoloadMap().get(name);
-        if (autoload != null) {
-            IRubyObject value = autoload.getValue();
-            if (value != null) {
-                storeConstant(name, value);
-            }
-            removeAutoload(name);
-            return value;
-        }
-        return null;
-    }
-    
-    /**
-     * Get autoload constant.
-     * If it's first resolution for the constant, it tries to require the defined feature and returns the defined value.
-     * Multi-threaded accesses are blocked and processed sequentially except if the caller is the autoloading thread.
-     */
-    public IRubyObject getAutoloadConstant(Ruby runtime, String name) {
-        Autoload autoload = getAutoloadMap().get(name);
-        if (autoload == null) {
-            return null;
-        }
-        return autoload.getConstant(runtime.getCurrentContext());
-    }
-    
-    /**
-     * Set an Object as a defined constant in autoloading.
-     */
-    private void setAutoloadConstant(String name, IRubyObject value) {
-        Autoload autoload = getAutoloadMap().get(name);
-        if (autoload != null) {
-            if (!autoload.setConstant(getRuntime().getCurrentContext(), value)) {
-                storeConstant(name, value);
-                removeAutoload(name);
-            }
-        } else {
-            storeConstant(name, value);
-        }
-    }
-    
-    /**
-     * Removes an Autoload object from autoloadMap. ConstantMap must be updated before calling this.
-     */
-    private void removeAutoload(String name) {
-        getAutoloadMapForWrite().remove(name);
-    }
-    
-    protected String getAutoloadFile(String name) {
-        Autoload autoload = getAutoloadMap().get(name);
-        if (autoload != null) {
-            return autoload.getFile();
-        }
-        return null;
     }
 
     private static void define(RubyModule module, JavaMethodDescriptor desc, DynamicMethod dynamicMethod) {
@@ -3553,77 +3488,6 @@ public class RubyModule extends RubyObject {
     private String anonymousName;
 
     private volatile Map<String, IRubyObject> constants = Collections.EMPTY_MAP;
-    
-    /**
-     * Objects for holding autoload state for the defined constant.
-     * 
-     * 'Module#autoload' creates this object and stores it in autoloadMap.
-     * This object can be shared with multiple threads so take care to change volatile and synchronized definitions.
-     */
-    private class Autoload {
-        // A ThreadContext which is executing autoload.
-        private volatile ThreadContext ctx;
-        // The lock for test-and-set the ctx.
-        private final Object ctxLock = new Object();
-        // An object defined for the constant while autoloading.
-        private volatile IRubyObject value;
-        // A method which actually requires a defined feature.
-        private final IAutoloadMethod loadMethod;
-
-        Autoload(IAutoloadMethod loadMethod) {
-            this.ctx = null;
-            this.value = null;
-            this.loadMethod = loadMethod;
-        }
-
-        // Returns an object for the constant if the caller is the autoloading thread.
-        // Otherwise, try to start autoloading and returns the defined object by autoload.
-        IRubyObject getConstant(ThreadContext ctx) {
-            synchronized (ctxLock) {
-                if (this.ctx == null) {
-                    this.ctx = ctx;
-                } else if (isSelf(ctx)) {
-                    return getValue();
-                }
-                // This method needs to be synchronized for removing Autoload
-                // from autoloadMap when it's loaded. 
-                getLoadMethod().load(ctx.runtime);
-            }
-            return getValue();
-        }
-        
-        // Update an object for the constant if the caller is the autoloading thread.
-        boolean setConstant(ThreadContext ctx, IRubyObject value) {
-            synchronized(ctxLock) {
-                if (this.ctx == null) {
-                    return false;
-                } else if (isSelf(ctx)) {
-                    this.value = value;
-                    return true;
-                }
-                return false;
-            }
-        }
-        
-        // Returns an object for the constant defined by autoload.
-        IRubyObject getValue() {
-            return value;
-        }
-        
-        // Returns the assigned feature.
-        String getFile() {
-            return getLoadMethod().file();
-        }
-
-        private IAutoloadMethod getLoadMethod() {
-            return loadMethod;
-        }
-
-        private boolean isSelf(ThreadContext rhs) {
-            return ctx != null && ctx.getThread() == rhs.getThread();
-        }
-    }
-    private volatile Map<String, Autoload> autoloads = Collections.EMPTY_MAP;
     private volatile Map<String, DynamicMethod> methods = Collections.EMPTY_MAP;
     protected Map<String, CacheEntry> cachedMethods = Collections.EMPTY_MAP;
     protected int generation;
